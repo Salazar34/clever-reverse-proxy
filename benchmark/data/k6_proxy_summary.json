@@ -1,0 +1,30 @@
+{
+  "metrics": {
+    "legit_req_duration": {
+      "values": {
+        "avg": 65.82,
+        "p(95)": 157.6
+      }
+    },
+    "status_http_200": {
+      "values": {
+        "count": 3816
+      }
+    },
+    "status_http_428": {
+      "values": {
+        "count": 1259
+      }
+    },
+    "status_http_429": {
+      "values": {
+        "count": 0
+      }
+    },
+    "status_http_5xx": {
+      "values": {
+        "count": 0
+      }
+    }
+  }
+}

@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: seclab-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: benchdb
+      POSTGRES_USER: benchuser
+      POSTGRES_PASSWORD: benchpassword
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - postgres_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U benchuser -d benchdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - seclab-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: seclab-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      - "6379:6379"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - seclab-net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: seclab-backend
+    restart: unless-stopped
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: benchuser
+      DB_PASSWORD: benchpassword
+      DB_NAME: benchdb
+      DB_POOL_MIN_SIZE: 5
+      DB_POOL_MAX_SIZE: 20
+      DB_COMMAND_TIMEOUT: 60.0
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - seclab-net
+
+  proxy:
+    build:
+      context: ./proxy
+      dockerfile: Dockerfile
+    container_name: seclab-proxy
+    restart: unless-stopped
+    environment:
+      BACKEND_URL: http://backend:8000
+      REDIS_URL: redis://redis:6379/0
+      POW_SECRET: "seclab-super-secret-hmac-key-2026"
+      POW_BASE_DIFFICULTY: 4
+      POW_TTL: 60
+      BUCKET_CAPACITY: 100.0
+      BUCKET_REFILL_RATE: 10.0
+      COST_CONFIG_PATH: config/cost_rules.yaml
+    ports:
+      - "8080:8080"
+    depends_on:
+      backend:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    networks:
+      - seclab-net
+
+volumes:
+  postgres_data:
+    name: seclab_postgres_data
+
+networks:
+  seclab-net:
+    name: seclab_internal_net
+    driver: bridge

@@ -1,0 +1,67 @@
+# =============================================================================
+# SecLab DoS Mitigation - Application-Level Computational Cost Rules
+# =============================================================================
+# Declarative weight configuration for heuristic cost estimation C(R).
+# Designed to mirror physical query execution costs (I/O, Seq Scans, Sorts)
+# determined by PostgreSQL 16's Cost-Based Query Planner.
+# =============================================================================
+
+# Global Gateway Constraints
+max_allowed_cost: 100.0       # C_max: queries exceeding this are dropped with HTTP 400
+default_unmatched_cost: 5.0   # Default penalty for unrecognized API routes
+
+routes:
+  # ---------------------------------------------------------------------------
+  # 1. Primary Key Lookup (Indexed O(1) Key-Lookup)
+  # Expected PG Planner Cost: ~8.45 (Index Scan + Nested Loop Join)
+  # ---------------------------------------------------------------------------
+  - name: "order_by_id"
+    path_pattern: "^/api/v1/orders/[0-9]+$"
+    methods:
+      - "GET"
+    base_cost: 1.0
+    parameter_rules: {}
+
+  # ---------------------------------------------------------------------------
+  # 2. Parametric Order Query (Subject to Asymmetric Algorithmic Complexity)
+  # Baseline PG Planner Cost: ~1.5 - 25.0 (without search/unindexed sorts)
+  # Pathological PG Planner Cost: 18,000 - 35,000+ (Seq Scan ILIKE, External Sort)
+  # ---------------------------------------------------------------------------
+  - name: "orders_list"
+    path_pattern: "^/api/v1/orders$"
+    methods:
+      - "GET"
+    base_cost: 5.0
+    parameter_rules:
+      # Linear cost for deep OFFSET pagination:
+      # Every 1,000 tuples skipped adds 1.0 credit to account for discarded tuple scans
+      offset:
+        type: "linear"
+        weight: 0.001
+        default: 0
+
+      # Linear cost for returned rows:
+      # Accounts for tuple deserialization and network serialization overhead
+      limit:
+        type: "linear"
+        weight: 0.05
+        default: 20
+
+      # Heavy presence penalty for substring search:
+      # 'notes' column is unindexed; ILIKE forces a Seq Scan across all 500k tuples
+      search:
+        type: "presence_penalty"
+        weight: 45.0
+
+      # Categorical penalty for sorting:
+      # Indexed fields (id, created_at, status) leverage B-Trees (~1-4)
+      # Non-indexed numeric/text fields require in-memory quicksort or disk-spilled external merge sorts
+      sort_by:
+        type: "categorical"
+        default: "id"
+        weights:
+          id: 1.0
+          created_at: 2.0
+          status: 4.0
+          total_amount: 15.0
+          notes: 35.0
