@@ -70,14 +70,15 @@ class WeightedRateLimiter:
         )
 
         try:
-            self.redis = aioredis.from_url(
-                self.redis_url,
-                encoding="utf-8",
-                decode_responses=True,
-                max_connections=100,
-                socket_connect_timeout=5.0,
-                socket_timeout=5.0,
-            )
+            if self.redis is None:
+                self.redis = aioredis.from_url(
+                    self.redis_url,
+                    encoding="utf-8",
+                    decode_responses=True,
+                    max_connections=100,
+                    socket_connect_timeout=5.0,
+                    socket_timeout=5.0,
+                )
             # Load script into Redis script cache and store SHA1
             self._script_sha = await self.redis.script_load(self._lua_code)
             logger.info(

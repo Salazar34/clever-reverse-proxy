@@ -7,8 +7,8 @@
 # =============================================================================
 
 # Global Gateway Constraints
-max_allowed_cost: 100.0       # C_max: queries exceeding this are dropped with HTTP 400
-default_unmatched_cost: 5.0   # Default penalty for unrecognized API routes
+max_allowed_cost: 100.0 # C_max: queries exceeding this are dropped with HTTP 400
+default_unmatched_cost: 5.0 # Default penalty for unrecognized API routes
 
 routes:
   # ---------------------------------------------------------------------------
@@ -20,6 +20,7 @@ routes:
     methods:
       - "GET"
     base_cost: 1.0
+    baseline_db_ms: 1.5
     parameter_rules: {}
 
   # ---------------------------------------------------------------------------
@@ -32,6 +33,7 @@ routes:
     methods:
       - "GET"
     base_cost: 5.0
+    baseline_db_ms: 10.0
     parameter_rules:
       # Linear cost for deep OFFSET pagination:
       # Every 1,000 tuples skipped adds 1.0 credit to account for discarded tuple scans

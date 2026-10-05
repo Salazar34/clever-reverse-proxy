@@ -70,6 +70,20 @@ flowchart TD
 - Esegue il mining locale del nonce che soddisfa la condizione di collisione parziale SHA-256 (prefisso di zeri esadecimali).
 - Re-invia la richiesta originale arricchita con gli header `X-PoW-Token` e `X-PoW-Nonce`.
 
+### 2.5 Feedback Loop Adattivo (Closed-Loop Cost Auto-Tuning, `proxy/adaptive_tuner.py`)
+- Chiude l'anello di retroazione intercettando l'header `X-DB-Execution-Time-Ms` emesso dal backend mock.
+- Mantiene su Redis una Media Mobile Esponenziale (EMA) dei tempi effettivi di risposta del database per ciascuna rotta:
+  $$EMA_t = (\alpha \times \text{tempo\_db\_ms}) + ((1 - \alpha) \times EMA_{t-1})$$
+- Calcola dinamicamente un moltiplicatore di sovraccarico $\gamma \ge 1.0$ rispetto alla baseline nominale (`baseline_db_ms`):
+  $$\text{rapporto} = \frac{EMA_t}{\max(1.0, \text{baseline\_db\_ms})}$$
+  $$\gamma = \min\left(\text{max\_multiplier}, 1.0 + (\text{rapporto} - 1.0) \times 0.5\right) \quad (\text{se rapporto} > 1.0)$$
+- Scala il costo computazionale a livello applicativo:
+  $$C_{effettivo}(R) = \min(C_{\max}, \text{round}(C_{statico}(R) \times \gamma, 2))$$
+- Inietta nei response header al client:
+  - `X-Cost-Assigned`: costo statico di base a priori.
+  - `X-Cost-Effective`: costo computazionale effettivo scalato con $\gamma$.
+  - `X-Adaptive-Multiplier`: valore istantaneo di $\gamma$.
+
 ---
 
 ## 3. Struttura del Repository
@@ -85,11 +99,12 @@ flowchart TD
 │   └── seeder.py                  # Generatore streaming COPY binario (500k righe)
 ├── proxy/                         # Reverse Proxy Gateway (FastAPI + Redis + PoW)
 │   ├── Dockerfile
-│   ├── config/cost_rules.yaml     # Regole dichiarative di stima costo computazionale
+│   ├── adaptive_tuner.py          # Feedback loop adattivo e calcolo EMA/gamma su Redis
+│   ├── config/cost_rules.yaml     # Regole dichiarative di stima costo con baseline_db_ms
 │   ├── cost_engine.py             # Motore analitico ultra-veloce (< 5 us)
-│   ├── lua/                       # Script Lua atomico Redis Token Bucket
+│   ├── lua/                       # Script Lua atomici Redis (Token Bucket & Adaptive EMA)
 │   │   └── weighted_token_bucket.lua
-│   ├── main.py                    # Reverse Proxy HTTPX dispatcher
+│   ├── main.py                    # Reverse Proxy HTTPX dispatcher con closed-loop tuning
 │   ├── pow_engine.py              # Motore PoW stateless HMAC-SHA256
 │   ├── rate_limiter.py            # Wrapper asincrono Redis EVALSHA
 │   └── requirements.txt
@@ -105,6 +120,7 @@ flowchart TD
 │   ├── run_experiments.py         # Orchestratore carichi e monitoraggio Docker stats
 │   └── run_live_benchmark.py      # Runner standalone ad alta fedeltà
 ├── tests/
+│   ├── test_adaptive_feedback.py  # Test suite feedback loop adattivo e decadimento gamma
 │   └── test_full_system.py        # Suite di test di integrazione end-to-end (8 test)
 ├── thesis_plots/                  # Grafici generati ad alta risoluzione (300 DPI)
 │   ├── fig1_cpu_utilization.png
@@ -136,6 +152,16 @@ Prima di avviare esperimenti di carico, è possibile verificare la correttezza l
 python3 tests/test_full_system.py
 ```
 *Output atteso:* 8 test superati su 8 in $< 1$ secondo.
+
+---
+
+### Step 1b: Esecuzione dei Test del Feedback Loop Adattivo (Closed-Loop Tuning)
+Per verificare specificamente il controllo ad anello chiuso tra telemetria di esecuzione DB (`X-DB-Execution-Time-Ms`), aggiornamento dell'EMA su Redis, incremento/decadimento del moltiplicatore $\gamma$ e amplificazione del costo effettivo:
+
+```bash
+python3 tests/test_adaptive_feedback.py
+```
+*Output atteso:* 5 test superati su 5 (comportamento nominale $\gamma=1.0$, escalation sotto stress $\gamma \to 3.0$, accelerazione del consumo crediti, decadimento a riposo e test end-to-end con header HTTP).
 
 ---
 

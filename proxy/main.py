@@ -26,11 +26,13 @@ from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse, Response as FastAPIResponse
 
 try:
-    from cost_engine import CostEngine
+    from adaptive_tuner import AdaptiveTuner
+    from cost_engine import CostEngine, CostEvaluation
     from pow_engine import PoWEngine
     from rate_limiter import WeightedRateLimiter
 except ImportError:
-    from proxy.cost_engine import CostEngine
+    from proxy.adaptive_tuner import AdaptiveTuner
+    from proxy.cost_engine import CostEngine, CostEvaluation
     from proxy.pow_engine import PoWEngine
     from proxy.rate_limiter import WeightedRateLimiter
 
@@ -49,6 +51,8 @@ POW_BASE_DIFFICULTY = int(os.getenv("POW_BASE_DIFFICULTY", "4"))
 POW_TTL = int(os.getenv("POW_TTL", "60"))
 BUCKET_CAPACITY = float(os.getenv("BUCKET_CAPACITY", "100.0"))
 BUCKET_REFILL_RATE = float(os.getenv("BUCKET_REFILL_RATE", "10.0"))
+ADAPTIVE_ALPHA = float(os.getenv("ADAPTIVE_ALPHA", "0.2"))
+ADAPTIVE_MAX_MULTIPLIER = float(os.getenv("ADAPTIVE_MAX_MULTIPLIER", "3.0"))
 COST_CONFIG_PATH = os.getenv(
     "COST_CONFIG_PATH",
     str(Path(__file__).resolve().parent / "config" / "cost_rules.yaml"),
@@ -96,7 +100,16 @@ async def lifespan(app: FastAPI):
     )
     app.state.pow_engine = pow_engine
 
-    # 4. Initialize persistent upstream HTTP client with connection pooling
+    # 4. Initialize AdaptiveTuner for Closed-Loop Cost Auto-Tuning
+    adaptive_tuner = AdaptiveTuner(
+        redis_client=rate_limiter.redis,
+        alpha=ADAPTIVE_ALPHA,
+        max_multiplier=ADAPTIVE_MAX_MULTIPLIER,
+    )
+    await adaptive_tuner.initialize()
+    app.state.adaptive_tuner = adaptive_tuner
+
+    # 5. Initialize persistent upstream HTTP client with connection pooling
     limits = httpx.Limits(max_connections=300, max_keepalive_connections=100)
     timeout = httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=10.0)
     http_client = httpx.AsyncClient(
@@ -107,10 +120,12 @@ async def lifespan(app: FastAPI):
     app.state.http_client = http_client
 
     logger.info(
-        "Gateway successfully primed: Upstream=%s | Redis=%s | C_max=%.1f",
+        "Gateway successfully primed: Upstream=%s | Redis=%s | C_max=%.1f | Adaptive=alpha:%.2f,max:%.1fx",
         BACKEND_URL,
         REDIS_URL,
         cost_engine.max_allowed_cost,
+        ADAPTIVE_ALPHA,
+        ADAPTIVE_MAX_MULTIPLIER,
     )
 
     yield
@@ -147,10 +162,12 @@ async def proxy_health() -> dict[str, Any]:
     """Diagnostic endpoint checking gateway component statuses."""
     rl: WeightedRateLimiter = app.state.rate_limiter
     redis_healthy = rl.redis is not None and bool(await rl.redis.ping())
+    tuner: AdaptiveTuner = getattr(app.state, "adaptive_tuner", None)
     return {
         "status": "healthy",
         "service": "reverse-proxy",
         "redis_connected": redis_healthy,
+        "adaptive_tuner_active": tuner is not None,
         "backend_target": BACKEND_URL,
     }
 
@@ -161,6 +178,7 @@ async def gateway_dispatcher(request: Request, path: str) -> Response:
     proxy_internal_work_s = 0.0
 
     cost_engine: CostEngine = app.state.cost_engine
+    adaptive_tuner: AdaptiveTuner | None = getattr(app.state, "adaptive_tuner", None)
     rate_limiter: WeightedRateLimiter = app.state.rate_limiter
     pow_engine: PoWEngine = app.state.pow_engine
     http_client: httpx.AsyncClient = app.state.http_client
@@ -171,29 +189,51 @@ async def gateway_dispatcher(request: Request, path: str) -> Response:
     client_id = extract_client_identity(request)
 
     # -------------------------------------------------------------------------
-    # STEP 1: Fast in-memory Cost Estimation C(R) (< 50 us)
+    # STEP 1: Fast In-Memory Cost Estimation & Closed-Loop Multiplier (< 50 us)
     # -------------------------------------------------------------------------
-    cost = cost_engine.estimate_cost(path=canonical_path, method=method, query_params=query_params)
+    if isinstance(cost_engine, CostEngine):
+        eval_res = cost_engine.evaluate_request(path=canonical_path, method=method, query_params=query_params)
+        static_cost = float(eval_res.cost)
+        route_name = eval_res.route_name
+        baseline_ms = float(eval_res.baseline_db_ms)
+    else:
+        static_cost = float(cost_engine.estimate_cost(path=canonical_path, method=method, query_params=query_params))
+        route_name = "unmatched"
+        baseline_ms = 10.0
+
+    if adaptive_tuner is not None:
+        gamma = float(await adaptive_tuner.get_multiplier(route_name))
+    else:
+        gamma = 1.0
+
+    max_cost = float(cost_engine.max_allowed_cost)
+    cost_effective = min(max_cost, round(static_cost * gamma, 2))
 
     # -------------------------------------------------------------------------
-    # STEP 2: Monster Query Protection (C(R) >= C_max) -> HTTP 400 Drop
+    # STEP 2: Monster Query Protection (cost_effective >= C_max) -> HTTP 400 Drop
     # -------------------------------------------------------------------------
-    if cost >= cost_engine.max_allowed_cost:
+    if cost_effective >= max_cost:
         logger.warning(
-            "MONSTER QUERY DETECTED from %s: %s %s (Cost: %.2f >= %.2f) -> Dropping with HTTP 400",
-            client_id, method, canonical_path, cost, cost_engine.max_allowed_cost,
+            "MONSTER QUERY DETECTED from %s: %s %s (Cost: %.2f [static: %.2f * gamma: %.2f] >= %.2f) -> Dropping with HTTP 400",
+            client_id, method, canonical_path, cost_effective, static_cost, gamma, max_cost,
         )
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={
                 "error": "Bad Request",
                 "detail": (
-                    f"Computational complexity C(R)={cost:.2f} exceeds structural limit "
-                    f"C_max={cost_engine.max_allowed_cost:.2f}. Request rejected to safeguard DBMS resources."
+                    f"Effective computational complexity C_eff={cost_effective:.2f} (static {static_cost:.2f} x {gamma:.2f}) "
+                    f"exceeds structural limit C_max={max_cost:.2f}. Request rejected to safeguard DBMS resources."
                 ),
-                "cost_assigned": cost,
+                "cost_assigned": static_cost,
+                "cost_effective": cost_effective,
+                "adaptive_multiplier": gamma,
             },
-            headers={"X-Cost-Assigned": f"{cost:.2f}"},
+            headers={
+                "X-Cost-Assigned": f"{static_cost:.2f}",
+                "X-Cost-Effective": f"{cost_effective:.2f}",
+                "X-Adaptive-Multiplier": f"{gamma:.2f}",
+            },
         )
 
     # -------------------------------------------------------------------------
@@ -222,12 +262,16 @@ async def gateway_dispatcher(request: Request, path: str) -> Response:
                     "error": "Forbidden",
                     "detail": f"Cryptographic Proof-of-Work validation failed: {reason}",
                 },
-                headers={"X-Cost-Assigned": f"{cost:.2f}"},
+                headers={
+                    "X-Cost-Assigned": f"{static_cost:.2f}",
+                    "X-Cost-Effective": f"{cost_effective:.2f}",
+                    "X-Adaptive-Multiplier": f"{gamma:.2f}",
+                },
             )
 
         logger.info(
-            "PoW VALIDATED for %s on %s %s (Cost: %.2f) -> Bypassing token bucket enforcement",
-            client_id, method, canonical_path, cost,
+            "PoW VALIDATED for %s on %s %s (Cost Effective: %.2f) -> Bypassing token bucket enforcement",
+            client_id, method, canonical_path, cost_effective,
         )
         pow_authorized = True
 
@@ -237,11 +281,11 @@ async def gateway_dispatcher(request: Request, path: str) -> Response:
     if not pow_authorized:
         allowed, remaining_tokens, retry_after = await rate_limiter.check_limit(
             client_id=client_id,
-            cost=cost,
+            cost=cost_effective,
         )
         if not allowed:
             # Client has exhausted their budget: issue RFC 6585 challenge
-            deficit = max(0.0, cost - remaining_tokens)
+            deficit = max(0.0, cost_effective - remaining_tokens)
             challenge = pow_engine.generate_challenge(
                 method=method,
                 path=canonical_path,
@@ -251,8 +295,8 @@ async def gateway_dispatcher(request: Request, path: str) -> Response:
             retry_after_int = max(1, math.ceil(retry_after))
 
             logger.info(
-                "RATE LIMIT EXCEEDED for %s (Cost: %.2f, Remaining: %.2f) -> HTTP 428 Challenge Issued (Diff: %d)",
-                client_id, cost, remaining_tokens, challenge["difficulty"],
+                "RATE LIMIT EXCEEDED for %s (Cost Effective: %.2f, Remaining: %.2f) -> HTTP 428 Challenge Issued (Diff: %d)",
+                client_id, cost_effective, remaining_tokens, challenge["difficulty"],
             )
 
             return JSONResponse(
@@ -260,13 +304,17 @@ async def gateway_dispatcher(request: Request, path: str) -> Response:
                 content={
                     "error": "Precondition Required",
                     "message": "Token bucket exhausted for requested computational complexity. Solve PoW challenge.",
-                    "cost_required": cost,
+                    "cost_required": cost_effective,
+                    "cost_static": static_cost,
+                    "adaptive_multiplier": gamma,
                     "remaining_tokens": remaining_tokens,
                     "challenge": challenge,
                 },
                 headers={
                     "Retry-After": str(retry_after_int),
-                    "X-Cost-Assigned": f"{cost:.2f}",
+                    "X-Cost-Assigned": f"{static_cost:.2f}",
+                    "X-Cost-Effective": f"{cost_effective:.2f}",
+                    "X-Adaptive-Multiplier": f"{gamma:.2f}",
                     "X-RateLimit-Remaining": f"{remaining_tokens:.2f}",
                 },
             )
@@ -279,7 +327,6 @@ async def gateway_dispatcher(request: Request, path: str) -> Response:
     # STEP 5: Upstream Forwarding via persistent async client
     # -------------------------------------------------------------------------
     req_body = await request.body()
-    # Strip hop-by-hop and PoW internal headers
     forward_headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in HOP_BY_HOP_HEADERS and k.lower() not in {"x-pow-token", "x-pow-nonce"}
@@ -299,16 +346,35 @@ async def gateway_dispatcher(request: Request, path: str) -> Response:
         return JSONResponse(
             status_code=status.HTTP_502_BAD_GATEWAY,
             content={"error": "Bad Gateway", "detail": f"Upstream service unavailable: {str(exc)}"},
-            headers={"X-Cost-Assigned": f"{cost:.2f}"},
+            headers={
+                "X-Cost-Assigned": f"{static_cost:.2f}",
+                "X-Cost-Effective": f"{cost_effective:.2f}",
+                "X-Adaptive-Multiplier": f"{gamma:.2f}",
+            },
         )
 
     # Measure post-forwarding gateway overhead
     t_post_forward = time.perf_counter()
 
     # -------------------------------------------------------------------------
-    # STEP 6: Telemetry Headers Injection & Response Relay
+    # STEP 6: Closed-Loop Telemetry Ingestion & Response Relay
     # -------------------------------------------------------------------------
-    # Build clean response headers
+    db_exec_ms_raw = (
+        upstream_response.headers.get("x-db-execution-time-ms")
+        or upstream_response.headers.get("X-DB-Execution-Time-Ms")
+    )
+    updated_gamma = gamma
+    if db_exec_ms_raw and adaptive_tuner is not None:
+        try:
+            db_exec_ms = float(db_exec_ms_raw)
+            updated_gamma = await adaptive_tuner.record_db_execution(
+                route_name=route_name,
+                execution_time_ms=db_exec_ms,
+                baseline_ms=baseline_ms,
+            )
+        except (ValueError, TypeError) as exc:
+            logger.warning("Could not parse X-DB-Execution-Time-Ms header '%s': %s", db_exec_ms_raw, exc)
+
     resp_headers = {
         k: v for k, v in upstream_response.headers.items()
         if k.lower() not in HOP_BY_HOP_HEADERS
@@ -318,7 +384,9 @@ async def gateway_dispatcher(request: Request, path: str) -> Response:
     proxy_internal_work_s += (t_final - t_post_forward)
     proxy_overhead_ms = proxy_internal_work_s * 1000.0
 
-    resp_headers["X-Cost-Assigned"] = f"{cost:.2f}"
+    resp_headers["X-Cost-Assigned"] = f"{static_cost:.2f}"
+    resp_headers["X-Cost-Effective"] = f"{cost_effective:.2f}"
+    resp_headers["X-Adaptive-Multiplier"] = f"{updated_gamma:.2f}"
     resp_headers["X-Proxy-Overhead-Ms"] = f"{proxy_overhead_ms:.2f}"
     resp_headers["X-PoW-Bypassed"] = "true" if pow_authorized else "false"
 

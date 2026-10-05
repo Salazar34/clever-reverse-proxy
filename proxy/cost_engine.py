@@ -60,7 +60,16 @@ class CompiledRoute:
     pattern: re.Pattern[str]
     methods: frozenset[str]
     base_cost: float
+    baseline_db_ms: float
     parameter_rules: dict[str, ParameterRule]
+
+
+@dataclass(slots=True, frozen=True)
+class CostEvaluation:
+    """Detailed evaluation result containing static cost and matched route metadata."""
+    cost: float
+    route_name: str
+    baseline_db_ms: float
 
 
 class CostEngine:
@@ -95,6 +104,7 @@ class CostEngine:
             path_pattern = str(r.get("path_pattern", ""))
             methods = frozenset(m.upper() for m in r.get("methods", ["GET"]))
             base_cost = float(r.get("base_cost", 1.0))
+            baseline_db_ms = float(r.get("baseline_db_ms", 10.0))
 
             param_rules: dict[str, ParameterRule] = {}
             for param_name, rule_def in (r.get("parameter_rules") or {}).items():
@@ -118,6 +128,7 @@ class CostEngine:
                     pattern=re.compile(path_pattern),
                     methods=methods,
                     base_cost=base_cost,
+                    baseline_db_ms=baseline_db_ms,
                     parameter_rules=param_rules,
                 )
             )
@@ -128,6 +139,53 @@ class CostEngine:
             len(self.routes),
             self.config_path,
             self.max_allowed_cost,
+        )
+
+    def evaluate_request(
+        self,
+        path: str,
+        method: str = "GET",
+        query_params: Mapping[str, Any] | None = None,
+    ) -> CostEvaluation:
+        """
+        Evaluates computational complexity C(R) and retrieves matched route metadata.
+
+        Args:
+            path: Absolute URL path (e.g. '/api/v1/orders').
+            method: HTTP method (e.g. 'GET').
+            query_params: Dictionary of parsed query string parameters.
+
+        Returns:
+            CostEvaluation dataclass with static cost, route_name, and baseline_db_ms.
+        """
+        method_upper = method.upper()
+        matched_route: CompiledRoute | None = None
+
+        # 1. High-speed regex path matching (< 2-5 us)
+        for route in self.routes:
+            if method_upper in route.methods and route.pattern.match(path):
+                matched_route = route
+                break
+
+        # 2. Fallback for unmatched routes
+        if matched_route is None:
+            cost = min(self.default_unmatched_cost, self.max_allowed_cost)
+            return CostEvaluation(cost=cost, route_name="unmatched", baseline_db_ms=10.0)
+
+        # 3. Summation of base cost and parametric rules
+        total_cost = matched_route.base_cost
+        params = query_params or {}
+
+        for param_name, rule in matched_route.parameter_rules.items():
+            val = params.get(param_name)
+            total_cost += rule.evaluate(val)
+
+        # 4. Normalization and clamping to upper ceiling C_max
+        final_cost = min(round(total_cost, 4), self.max_allowed_cost)
+        return CostEvaluation(
+            cost=final_cost,
+            route_name=matched_route.name,
+            baseline_db_ms=matched_route.baseline_db_ms,
         )
 
     def estimate_cost(
@@ -147,26 +205,4 @@ class CostEngine:
         Returns:
             A float representing the estimated computational cost, clamped to max_allowed_cost.
         """
-        method_upper = method.upper()
-        matched_route: CompiledRoute | None = None
-
-        # 1. High-speed regex path matching (< 2-5 us)
-        for route in self.routes:
-            if method_upper in route.methods and route.pattern.match(path):
-                matched_route = route
-                break
-
-        # 2. Fallback for unmatched routes
-        if matched_route is None:
-            return min(self.default_unmatched_cost, self.max_allowed_cost)
-
-        # 3. Summation of base cost and parametric rules
-        total_cost = matched_route.base_cost
-        params = query_params or {}
-
-        for param_name, rule in matched_route.parameter_rules.items():
-            val = params.get(param_name)
-            total_cost += rule.evaluate(val)
-
-        # 4. Normalization and clamping to upper ceiling C_max
-        return min(round(total_cost, 4), self.max_allowed_cost)
+        return self.evaluate_request(path=path, method=method, query_params=query_params).cost
